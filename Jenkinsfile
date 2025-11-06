@@ -1,162 +1,129 @@
-Jenkinsfile
 pipeline {
-    agent any // Must be a Windows agent
+    agent any
 
     environment {
-        BLUE_PORT    = 8081
-        GREEN_PORT   = 8082
-        // CHANGE THIS to your Docker Hub username/repo
-        IMAGE_NAME   = "sanjeethmanikandan/blue-green-node-app"
-        NGINX_PATH   = "C:\\nginx-1.28.0" // Your NGINX install directory
-        NGINX_CONFIG = "C:\\nginx-1.28.0\\conf\\live-upstream.conf" // The file to overwrite
+        // Change this to your Docker Hub username
+        DOCKER_IMAGE = "sanjeethmanikandan/blue-green-node-app"
+        // Jenkins credential ID for Docker Hub login
+        DOCKER_CREDENTIALS = "dockerhub-creds"
     }
 
     stages {
-        stage('1. Build & Push Docker Image') {
+        stage('Checkout Code') {
             steps {
-                script {
-                    env.IMAGE_TAG = "${env.BUILD_NUMBER}"
-                    def dockerImage = "${IMAGE_NAME}:${IMAGE_TAG}"
-                    
-                    echo "Building Docker image: ${dockerImage}"
-                    bat "docker build -t ${dockerImage} ."
-                    
-                    // CHANGE THIS 'dockerHubCredentialsId' to your Jenkins credential ID
-                    withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
-                        bat "docker login -u ${DOCKER_USER} -p ${DOCKER_PASS}"
-                        bat "docker push ${dockerImage}"
-                        bat "docker logout"
-                    }
-                }
+                echo "Checking out source code..."
+                checkout scm
             }
         }
 
-        stage('2. Determine Idle Environment') {
+        stage('Build Docker Image') {
             steps {
                 script {
-                    // Check NGINX config to see which port is "live"
-                    def liveConfig = bat(script: "type ${env.NGINX_CONFIG}", returnStdout: true).trim()
-                    
-                    if (liveConfig.contains("${BLUE_PORT}")) {
-                        // BLUE is LIVE, so GREEN is IDLE
-                        env.IDLE_ENV_NAME  = "green"
-                        env.IDLE_PORT      = env.GREEN_PORT
-                        env.IDLE_COLOR     = "Green"
-                        env.LIVE_ENV_NAME  = "blue"
-                    } else {
-                        // GREEN is LIVE, so BLUE is IDLE
-                        env.IDLE_ENV_NAME  = "blue"
-                        env.IDLE_PORT      = env.BLUE_PORT
-                        env.IDLE_COLOR     = "Blue"
-                        env.LIVE_ENV_NAME  = "green"
-                    }
-                    echo "LIVE environment: ${env.LIVE_ENV_NAME}"
-                    echo "Deploying new version to IDLE environment: ${env.IDLE_ENV_NAME} on port ${env.IDLE_PORT}"
-                }
-            }
-        }
+                    // Tag image using Jenkins build number
+                    IMAGE_TAG = "${env.BUILD_NUMBER}"
+                    FULL_IMAGE = "${DOCKER_IMAGE}:${IMAGE_TAG}"
+                    LATEST_IMAGE = "${DOCKER_IMAGE}:latest"
 
-        stage('3. Deploy to Idle Environment') {
-            steps {
-                script {
-                    def dockerImage = "${IMAGE_NAME}:${IMAGE_TAG}"
-                    
-                    // --- START FIX ---
-                    // We use try-catch because the container might not exist,
-                    // and we don't want that to fail the build.
-                    
-                    try {
-                        echo "Attempting to stop old ${env.IDLE_ENV_NAME} container..."
-                        bat "docker stop ${env.IDLE_ENV_NAME}"
-                    } catch (e) {
-                        echo "Container ${env.IDLE_ENV_NAME} was not running. This is normal."
-                    }
-                    
-                    try {
-                        echo "Attempting to remove old ${env.IDLE_ENV_NAME} container..."
-                        bat "docker rm ${env.IDLE_ENV_NAME}"
-                    } catch (e) {
-                        echo "Container ${env.IDLE_ENV_NAME} did not exist. This is normal."
-                    }
-                    // --- END FIX ---
-                    
-                    
-                    // Run the new container in the idle slot
-                    echo "Starting new ${env.IDLE_ENV_NAME} container..."
-                    // The ^ character is the line-continuation for Windows batch
-                    bat """
-                    docker run -d --name ${env.IDLE_ENV_NAME} ^
-                        -p ${env.IDLE_PORT}:3000 ^
-                        -e APP_COLOR=${env.IDLE_COLOR} ^
-                        ${dockerImage}
+                    echo "Building Docker image: ${FULL_IMAGE}"
+                    sh """
+                        docker build -t ${FULL_IMAGE} -t ${LATEST_IMAGE} .
                     """
                 }
             }
         }
 
-        stage('4. Test Idle Environment') {
-            steps {
-                echo "Testing new deployment on port ${env.IDLE_PORT}..."
-                
-                // FIX: Use the 'sleep' step instead of 'timeout'
-                echo "Waiting 10 seconds for container to start..."
-                sleep time: 10, unit: 'SECONDS'
-                
-                // Use 'curl' (assuming it's in your Windows PATH)
-                echo "Running curl test..."
-                bat "curl -f http://localhost:${env.IDLE_PORT}/"
-            }
-        }
-
-        stage('5. Promote: Switch Traffic') {
-            steps {
-                input message: "Deployment to ${env.IDLE_ENV_NAME} passed testing. Switch live traffic?"
-                
-                echo "Switching NGINX to point to ${env.IDLE_ENV_NAME} on port ${env.IDLE_PORT}"
-
-                script {
-                    // Create the new NGINX config fragment
-                    def newUpstreamConfig = "upstream live_app { server 127.0.0.1:${env.IDLE_PORT}; }"
-                    
-                    // Overwrite the NGINX config file
-                    bat "echo ${newUpstreamConfig} > ${env.NGINX_CONFIG}"
-                    
-                    // --- START FIX ---
-                    // Try to reload NGINX. If it fails (e.g., not running), start it.
-                    try {
-                        echo "Attempting to reload NGINX..."
-                        bat "cd ${env.NGINX_PATH} && nginx.exe -s reload"
-                    } catch (e) {
-                        echo "Reload failed. Assuming NGINX is not running. Attempting to start..."
-                        // Use "start nginx.exe" to launch it in the background
-                        bat "cd ${env.NGINX_PATH} && start nginx.exe"
-                    }
-                    // --- END FIX ---
-                }
-                
-                echo "Traffic successfully switched to ${env.IDLE_ENV_NAME}."
-            }
-        }
-
-        stage('6. Cleanup Old Live Environment') {
+        stage('Push to Docker Hub') {
             steps {
                 script {
-                    echo "Stopping old ${env.LIVE_ENV_NAME} container..."
-                    
-                    try {
-                        bat "docker stop ${env.LIVE_ENV_NAME}"
-                    } catch (e) {
-                        echo "Container ${env.LIVE_ENV_NAME} was not running. This is normal."
-                    }
-                    
-                    try {
-                        echo "Attempting to remove old ${env.LIVE_ENV_NAME} container..."
-                        bat "docker rm ${env.LIVE_ENV_NAME}"
-                    } catch (e) {
-                        echo "Container ${env.LIVE_ENV_NAME} did not exist. This is normal."
+                    echo "Pushing image to Docker Hub..."
+                    withCredentials([usernamePassword(credentialsId: DOCKER_CREDENTIALS, usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+                        sh """
+                            echo $PASS | docker login -u $USER --password-stdin
+                            docker push ${FULL_IMAGE}
+                            docker push ${LATEST_IMAGE}
+                            docker logout
+                        """
                     }
                 }
             }
+        }
+
+        stage('Blue-Green Deployment') {
+            steps {
+                script {
+                    echo "Starting Blue-Green deployment process..."
+
+                    // Detect which container is currently active
+                    def activeContainer = sh(
+                        script: "docker ps --format '{{.Names}}' | grep -E 'blue|green' || true",
+                        returnStdout: true
+                    ).trim()
+
+                    def newColor, oldColor, newPort
+
+                    if (activeContainer == "blue") {
+                        newColor = "green"
+                        oldColor = "blue"
+                        newPort = "3002"
+                    } else {
+                        newColor = "blue"
+                        oldColor = "green"
+                        newPort = "3001"
+                    }
+
+                    echo "Active container: ${activeContainer == '' ? 'none' : activeContainer}"
+                    echo "Deploying new version as ${newColor} container on port ${newPort}"
+
+                    // Pull the latest image (optional for local)
+                    sh "docker pull ${FULL_IMAGE} || true"
+
+                    // Stop existing newColor container if exists
+                    sh "docker rm -f ${newColor} || true"
+
+                    // Run the new container
+                    sh """
+                        docker run -d --name ${newColor} -e APP_VERSION=${IMAGE_TAG} -p ${newPort}:3000 ${FULL_IMAGE}
+                    """
+
+                    // Health check loop
+                    echo "Performing health check..."
+                    def retries = 10
+                    def success = false
+                    for (int i = 0; i < retries; i++) {
+                        def result = sh(
+                            script: "curl -sSf http://localhost:${newPort}/health || true",
+                            returnStdout: true
+                        ).trim()
+                        if (result.contains("OK")) {
+                            echo "Health check passed!"
+                            success = true
+                            break
+                        }
+                        sleep 3
+                    }
+
+                    if (!success) {
+                        error("❌ Health check failed! Rolling back deployment.")
+                    }
+
+                    // If healthy, remove the old container
+                    if (oldColor != "") {
+                        echo "Stopping old container: ${oldColor}"
+                        sh "docker rm -f ${oldColor} || true"
+                    }
+
+                    echo "✅ Successfully switched to ${newColor} container (version ${IMAGE_TAG})"
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "🎉 Blue-Green Deployment completed successfully!"
+        }
+        failure {
+            echo "⚠️ Deployment failed. Review the Jenkins logs."
         }
     }
 }
