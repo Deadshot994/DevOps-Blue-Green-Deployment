@@ -22,7 +22,7 @@ pipeline {
                     bat "docker build -t ${dockerImage} ."
                     
                     // CHANGE THIS 'dockerHubCredentialsId' to your Jenkins credential ID
-                    withCredentials([usernamePassword(credentialsId: 'dockerHubCredentialsId', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                    withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
                         bat "docker login -u ${DOCKER_USER} -p ${DOCKER_PASS}"
                         bat "docker push ${dockerImage}"
                         bat "docker logout"
